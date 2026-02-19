@@ -31,14 +31,20 @@ final class GeminiProtocolTests: XCTestCase {
     }
 
     override func setUp() async throws {
+        GeminiProtocol.usePlaintextTransport = true
         URLProtocol.registerClass(GeminiProtocol.self)
     }
     
+    override func tearDown() async throws {
+        await server.stop()
+        GeminiProtocol.usePlaintextTransport = false
+        URLProtocol.unregisterClass(GeminiProtocol.self)
+    }
+    
     func testRequest() async throws {
-        await server.start(header: GeminiHeaders.successWithGeminiContent, body: GeminiBodies.genericBody)
+        let port = try await server.start(header: GeminiHeaders.successWithGeminiContent, body: GeminiBodies.genericBody)
 
-        let url = URL(string: "gemini://localhost:1965")!
-//        let url = URL(string: "gemini://gemini.circumlunar.space/")!
+        let url = URL(string: "gemini://127.0.0.1:\(port)")!
         let client = try GeminiClient(request: URLRequest(url: url), debug: true)
         let (header, maybeData) = try await client.start()
         
@@ -48,5 +54,26 @@ final class GeminiProtocolTests: XCTestCase {
         let string = try XCTUnwrap(String(data: data, encoding: .utf8))
         
         XCTAssertEqual(string, GeminiBodies.genericBody)
+    }
+    
+    func testURLSessionProtocolIntegration() async throws {
+        let port = try await server.start(header: GeminiHeaders.successWithGeminiContent, body: GeminiBodies.genericBody)
+        
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GeminiProtocol.self]
+        let session = URLSession(configuration: configuration)
+        
+        let url = URL(string: "gemini://127.0.0.1:\(port)")!
+        let (data, response) = try await session.data(from: url)
+        
+        if let geminiResponse = response as? GeminiURLResponse {
+            XCTAssertEqual(geminiResponse.statusCode, .success)
+            XCTAssertEqual(geminiResponse.meta, "text/gemini")
+        } else {
+            XCTAssertEqual(response.mimeType, "text/gemini")
+        }
+        
+        let body = try XCTUnwrap(String(data: data, encoding: .utf8))
+        XCTAssertEqual(body, GeminiBodies.genericBody)
     }
 }

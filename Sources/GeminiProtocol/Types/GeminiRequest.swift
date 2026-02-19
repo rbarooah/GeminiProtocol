@@ -1,30 +1,41 @@
 //
 // GeminiRequest.swift
 //
-// Copyright © 2022 Izzy Fraimow. All rights reserved.
 //
 
 import Foundation
-import Network
 
+/// Canonical Gemini request line representation used by the network client.
 public struct GeminiRequest: Sendable {
-    let url: URL
+    let absoluteURI: String
     
     var data: Data {
-        let header = "\(url.absoluteString)\r\n"
-        let data = header.data(using: .utf8)!
-        return data
-    }
-}
-
-extension NWProtocolFramer.Message {
-    static let requestKey = "GeminiRequest"
-    convenience init(geminiRequest request: GeminiRequest) {
-        self.init(definition: GeminiFramer.definition)
-        self[Self.requestKey] = request
+        Data("\(absoluteURI)\r\n".utf8)
     }
     
-    var geminiRequest: GeminiRequest? {
-        self[Self.requestKey] as? GeminiRequest
+    init(url: URL) throws {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            throw GeminiClientError.initializationError("Could not parse URL components")
+        }
+        
+        guard components.user == nil, components.password == nil else {
+            throw GeminiClientError.initializationError("User info is not allowed in Gemini URLs")
+        }
+        
+        guard components.scheme?.lowercased() == "gemini" else {
+            throw GeminiClientError.initializationError("URL scheme must be gemini")
+        }
+        
+        var normalized = components
+        normalized.fragment = nil
+        if normalized.path.isEmpty {
+            normalized.path = "/"
+        }
+        
+        guard let normalizedURL = normalized.url else {
+            throw GeminiClientError.initializationError("Could not normalize Gemini URL")
+        }
+        
+        self.absoluteURI = normalizedURL.absoluteString
     }
 }

@@ -1,25 +1,89 @@
 //
 // GeminiNetwork.swift
 //
-// Copyright © 2022 Izzy Fraimow. All rights reserved.
 //
 
 import Foundation
 import Network
-import os.log
 
+/// TLS verification behavior used by ``GeminiClient``.
+public enum GeminiTLSMode: Sendable, Equatable {
+    /// Uses platform certificate validation.
+    case systemTrust
+    /// Disables certificate validation.
+    ///
+    /// - Important: This mode is intended for testing/debugging only.
+    case insecureNoVerification
+}
+
+private final class ResponseResolver: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<(GeminiResponseHeader, Data?), Error>?
+    private let onResolve: () -> Void
+    
+    init(
+        continuation: CheckedContinuation<(GeminiResponseHeader, Data?), Error>,
+        onResolve: @escaping () -> Void
+    ) {
+        self.continuation = continuation
+        self.onResolve = onResolve
+    }
+    
+    func resume(returning value: (GeminiResponseHeader, Data?)) {
+        resolve(.success(value))
+    }
+    
+    func resume(throwing error: Error) {
+        resolve(.failure(error))
+    }
+    
+    private func resolve(_ result: Result<(GeminiResponseHeader, Data?), Error>) {
+        lock.lock()
+        guard let continuation else {
+            lock.unlock()
+            return
+        }
+        
+        self.continuation = nil
+        lock.unlock()
+        
+        onResolve()
+        
+        switch result {
+        case .success(let value):
+            continuation.resume(returning: value)
+        case .failure(let error):
+            continuation.resume(throwing: error)
+        }
+    }
+}
+
+/// A low-level Gemini network client backed by `Network.framework`.
 public actor GeminiClient {
+    private static let maxHeaderLength = 1024
+    private static let receiveChunkSize = 64 * 1024
+    
     private let connection: NWConnection
     private let request: GeminiRequest
     private let queue = DispatchQueue(label: "com.geminiprotocol.gemini-client")
+    private var isInFlight = false
     
-    public init(request: URLRequest) throws {
-        try self.init(request: request, debug: false)
+    /// Creates a Gemini client for a request.
+    ///
+    /// - Parameters:
+    ///   - request: A URL request whose URL must use the `gemini` scheme.
+    ///   - tlsMode: TLS verification mode for the connection.
+    /// - Throws: ``GeminiClientError`` when the request URL is invalid for Gemini.
+    public init(request: URLRequest, tlsMode: GeminiTLSMode = .systemTrust) throws {
+        try self.init(request: request, debug: false, tlsMode: tlsMode)
     }
     
-    internal init(request: URLRequest, debug: Bool = false) throws {
+    internal init(request: URLRequest, debug: Bool = false, tlsMode: GeminiTLSMode = .systemTrust) throws {
         guard let url = request.url else { throw GeminiClientError.initializationError("No URL specified") }
-        self.request = GeminiRequest(url: url)
+        self.request = try GeminiRequest(url: url)
+        guard self.request.data.count <= Self.maxHeaderLength else {
+            throw GeminiClientError.initializationError("Request exceeds Gemini 1024-byte line limit")
+        }
         
         guard let urlHost = request.url?.host else { throw GeminiClientError.initializationError("No host specified") }
         let host = NWEndpoint.Host(urlHost)
@@ -27,40 +91,56 @@ public actor GeminiClient {
         let urlPort = request.url?.port.map(UInt16.init) ?? 1965
         guard let port = NWEndpoint.Port(rawValue: urlPort) else { throw GeminiClientError.initializationError("Invalid port") }
         
-        let parameters = NWParameters.gemini(queue, debug: debug)
+        let parameters = NWParameters.gemini(queue, debug: debug, tlsMode: tlsMode)
         self.connection = NWConnection(host: host, port: port, using: parameters)
     }
     
-    public func start() async throws -> (GeminiResponseHeader, Data?) {        
+    /// Starts the request and waits for a Gemini response.
+    ///
+    /// - Parameter timeout: Request timeout in seconds.
+    /// - Returns: A tuple of parsed response header and optional response body.
+    ///   For non-success status codes, the body value is `nil`.
+    /// - Throws: ``GeminiClientError`` or lower-level networking errors.
+    public func start(timeout: TimeInterval = 30) async throws -> (GeminiResponseHeader, Data?) {
+        guard timeout > 0 else {
+            throw GeminiClientError.initializationError("Timeout must be greater than zero")
+        }
+        
+        guard !isInFlight else {
+            throw GeminiClientError.transactionError("A request is already in flight for this client")
+        }
+        
+        isInFlight = true
+        defer { isInFlight = false }
+        
+        let connection = self.connection
+        let request = self.request
+        let timeoutInterval = DispatchTimeInterval.milliseconds(max(1, Int(timeout * 1000)))
+        
         return try await withCheckedThrowingContinuation { continuation in
-            connection.stateUpdateHandler = { [weak self] state in
-                guard let self = self else {
-                    continuation.resume(throwing: GeminiClientError.transactionError("GeminiClient disappeared while a request was in flight"))
-                    return
-                }
-                
+            let resolver = ResponseResolver(continuation: continuation) {
+                connection.stateUpdateHandler = nil
+                connection.cancel()
+            }
+            
+            connection.stateUpdateHandler = { state in
                 switch state {
                 case .waiting(let error):
-                    continuation.resume(throwing: error)
+                    resolver.resume(throwing: error)
                 case .ready:
-                    // For some reason Swift concurrency thought there was an isolation mismatch when I tried to break this out into its own method like `setupReceive` below, so it's inline for now
-                    let message = NWProtocolFramer.Message(geminiRequest: self.request)
-                    let context = NWConnection.ContentContext(identifier: "GeminiRequest", metadata: [message])
-                    
-                    self.connection.send(
-                        content: nil,
-                        contentContext: context,
+                    connection.send(
+                        content: request.data,
                         isComplete: true,
                         completion: .contentProcessed { error in
                             if let error = error {
-                                print(error)
+                                resolver.resume(throwing: error)
                             }
                         }
                     )
                 case .failed(let error):
-                    continuation.resume(throwing: error)
+                    resolver.resume(throwing: error)
                 case .cancelled:
-                    continuation.resume(throwing: GeminiClientError.cancelled)
+                    resolver.resume(throwing: GeminiClientError.cancelled)
                 case .setup, .preparing:
                     fallthrough
                 @unknown default:
@@ -68,115 +148,148 @@ public actor GeminiClient {
                 }
             }
             
-            setupReceive(continuation: continuation)
+            GeminiClient.setupReceive(connection: connection, resolver: resolver, data: Data())
             
             connection.start(queue: queue)
+            queue.asyncAfter(deadline: .now() + timeoutInterval) {
+                resolver.resume(throwing: GeminiClientError.timeout(timeout))
+            }
         }
     }
     
+    /// Stops any in-flight request and closes the underlying connection.
     public func stop() {
-        self.connection.stateUpdateHandler = nil
-        self.connection.cancel()
+        isInFlight = false
+        connection.stateUpdateHandler = nil
+        connection.cancel()
     }
     
-    private func setupReceive<T>(continuation: CheckedContinuation<T, Error>) {
-        connection.receiveMessage { (data, context, isComplete, error) in
-            defer {
-                self.stop()
+    private nonisolated static func setupReceive(connection: NWConnection, resolver: ResponseResolver, data: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: receiveChunkSize) { chunk, _, isComplete, error in
+            var accumulated = data
+            if let chunk {
+                accumulated.append(chunk)
             }
             
-            if let error = error {
-                continuation.resume(throwing: error)
+            if let receiveError = error {
+                do {
+                    let result = try parseResponse(accumulated)
+                    resolver.resume(returning: result)
+                } catch {
+                    resolver.resume(throwing: receiveError)
+                }
+                return
+            }
+            
+            if Self.headerRange(in: accumulated) == nil, accumulated.count > maxHeaderLength {
+                resolver.resume(throwing: GeminiClientError.transactionError("Invalid Gemini response - header exceeds 1024 bytes"))
                 return
             }
             
             guard isComplete else {
-                continuation.resume(throwing: GeminiClientError.transactionError("Invalid Gemini response — Expected a single transaction"))
+                setupReceive(connection: connection, resolver: resolver, data: accumulated)
                 return
             }
             
-            guard
-                let message = context?.protocolMetadata(definition: GeminiFramer.definition) as? NWProtocolFramer.Message,
-                let header = message.geminiResponseHeader else {
-                    continuation.resume(throwing: GeminiClientError.transactionError("Invalid Gemini response — Invalid header"))
-                    return
-                }
-            
-            print("header: \(header)")
-            print("data: \(String(data: data ?? Data(), encoding: .utf8)!)")
-            
-            continuation.resume(returning: (header, data) as! T)
+            do {
+                let result = try parseResponse(accumulated)
+                resolver.resume(returning: result)
+            } catch {
+                resolver.resume(throwing: error)
+            }
         }
     }
-}
-
-class GeminiFramer: NWProtocolFramerImplementation {
-    static let definition = NWProtocolFramer.Definition(implementation: GeminiFramer.self)
     
-    static var label = "Gemini"
-    
-    // Set the default behavior for most framing protocol functions.
-    required init(framer: NWProtocolFramer.Instance) { }
-    func start(framer: NWProtocolFramer.Instance) -> NWProtocolFramer.StartResult { return .ready }
-    func wakeup(framer: NWProtocolFramer.Instance) { }
-    func stop(framer: NWProtocolFramer.Instance) -> Bool { return true }
-    func cleanup(framer: NWProtocolFramer.Instance) { }
-    
-    private var statusCode = StatusCodeParser()
-    private var space = SpaceParser()
-    private var meta = MetaParser()
-    
-    func handleInput(framer: NWProtocolFramer.Instance) -> Int {
-        if !statusCode.consume(framer) {
-            return statusCode.expectedRemainingLength
+    private nonisolated static func parseResponse(_ data: Data) throws -> (GeminiResponseHeader, Data?) {
+        guard let headerRange = headerRange(in: data) else {
+            throw GeminiClientError.transactionError("Invalid Gemini response - missing header delimiter")
         }
         
-        if !space.consume(framer) {
-            return space.expectedRemainingLength
+        let headerLength = data.distance(from: data.startIndex, to: headerRange.upperBound)
+        guard headerLength <= maxHeaderLength else {
+            throw GeminiClientError.transactionError("Invalid Gemini response - header exceeds 1024 bytes")
         }
         
-        if !meta.consume(framer) {
-            return meta.expectedRemainingLength
+        let headerBytes = data[..<headerRange.lowerBound]
+        if headerBytes.starts(with: [0xEF, 0xBB, 0xBF]) {
+            throw GeminiClientError.transactionError("Invalid Gemini response - header begins with UTF-8 BOM")
+        }
+        guard let headerString = String(data: headerBytes, encoding: .utf8) else {
+            throw GeminiClientError.transactionError("Invalid Gemini response - header is not UTF-8")
         }
         
-        let status = statusCode.result()
-        let metaString = meta.result()
+        guard headerString.count >= 2 else {
+            throw GeminiClientError.transactionError("Invalid Gemini response - malformed header")
+        }
         
-        let header = GeminiResponseHeader(status: status, meta: metaString)
-        let message = NWProtocolFramer.Message(geminiResponseHeader: header)
+        let statusDigits = String(headerString.prefix(2))
+        guard
+            let statusValue = Int(statusDigits),
+            let status = GeminiStatusCode.fromProtocolValue(statusValue) else {
+                throw GeminiClientError.transactionError("Invalid Gemini response - status code is not valid")
+        }
         
-        _ = framer.deliverInputNoCopy(length: status == .success ? .max : 0, message: message, isComplete: true)
+        let statusEnd = headerString.index(headerString.startIndex, offsetBy: 2)
+        let suffix = headerString[statusEnd...]
         
-        framer.passThroughInput()
-        return 0
+        let meta: String
+        if suffix.isEmpty {
+            if status.requiresMeta {
+                throw GeminiClientError.transactionError("Invalid Gemini response - missing required meta")
+            }
+            meta = ""
+        } else {
+            guard suffix.first == " " else {
+                throw GeminiClientError.transactionError("Invalid Gemini response - missing status separator")
+            }
+            meta = String(suffix.dropFirst())
+            if meta.isEmpty {
+                throw GeminiClientError.transactionError("Invalid Gemini response - empty meta after separator")
+            }
+        }
+        
+        let header = GeminiResponseHeader(status: status, meta: meta)
+        
+        let bodySlice = data[headerRange.upperBound...]
+        let body = bodySlice.isEmpty ? Data() : Data(bodySlice)
+        return (header, status.isSuccess ? body : nil)
     }
     
-    func handleOutput(framer: NWProtocolFramer.Instance, message: NWProtocolFramer.Message, messageLength: Int, isComplete: Bool) {
-        let request = message.geminiRequest!
-        framer.writeOutput(data: request.data)
+    private nonisolated static func headerRange(in data: Data) -> Range<Data.Index>? {
+        guard data.count >= 2 else { return nil }
+        
+        var index = data.startIndex
+        let end = data.index(before: data.endIndex)
+        
+        while index < end {
+            let nextIndex = data.index(after: index)
+            if data[index] == 0x0d, data[nextIndex] == 0x0a {
+                return index..<data.index(after: nextIndex)
+            }
+            index = nextIndex
+        }
+        
+        return nil
     }
 }
 
 extension NWParameters {
-    static func gemini(_ queue: DispatchQueue, debug: Bool = false) -> NWParameters {
+    static func gemini(_ queue: DispatchQueue, debug: Bool = false, tlsMode: GeminiTLSMode = .systemTrust) -> NWParameters {
         let parameters: NWParameters
         if debug {
             parameters = .tcp
         } else {
             let tlsOptions = NWProtocolTLS.Options()
             sec_protocol_options_set_min_tls_protocol_version(tlsOptions.securityProtocolOptions, .TLSv12)
-            sec_protocol_options_set_verify_block(tlsOptions.securityProtocolOptions, { (sec_protocol_metadata, sec_trust, sec_protocol_verify_complete) in
-                // TODO: Actually handle TLS the way the spec says to. See section #4 of https://gemini.circumlunar.space/docs/specification.gmi
-                sec_protocol_verify_complete(true)
-            }, queue)
+            if tlsMode == .insecureNoVerification {
+                sec_protocol_options_set_verify_block(tlsOptions.securityProtocolOptions, { _, _, secProtocolVerifyComplete in
+                    secProtocolVerifyComplete(true)
+                }, queue)
+            }
             
             let tcpOptions = NWProtocolTCP.Options()
-            
             parameters = NWParameters(tls: tlsOptions, tcp: tcpOptions)
         }
-        
-        let options = NWProtocolFramer.Options(definition: GeminiFramer.definition)
-        parameters.defaultProtocolStack.applicationProtocols.insert(options, at: 0)
         
         return parameters
     }

@@ -1,0 +1,10 @@
+# Gemini robots policy
+User-agent: *
+Disallow: /private
+Disallow: /tmp
+
+User-agent: indexer
+Disallow: /search
+
+User-agent: webproxy
+Disallow: /

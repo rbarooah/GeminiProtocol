@@ -1,0 +1,7 @@
+# Example Capsule Log
+## Recent Posts
+
+=> first.gmi 2026-02-17 - First post
+=> second.gmi 2026-02-18 Second post
+=> /not-an-entry Just a link
+Text after entries

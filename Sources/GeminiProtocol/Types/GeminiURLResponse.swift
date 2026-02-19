@@ -1,27 +1,38 @@
 //
 // GeminiURLResponse.swift
 //
-// Copyright © 2022 Izzy Fraimow. All rights reserved.
 //
 
 import Foundation
 
-let StatusCodeKey = "StatusCodeKey"
-let MetaKey = "MetaKey"
+private let StatusCodeKey = "StatusCodeKey"
+private let MetaKey = "MetaKey"
 
-public class GeminiURLResponse: URLResponse {
-    var statusCode: GeminiStatusCode
-    var meta: String
+/// `URLResponse` subclass carrying Gemini-specific response fields.
+public final class GeminiURLResponse: URLResponse, @unchecked Sendable {
+    /// Gemini status code.
+    public let statusCode: GeminiStatusCode
+    /// Raw Gemini meta string.
+    public let meta: String
     
+    /// Indicates support for secure coding.
     class public override var supportsSecureCoding: Bool {
         true
     }
     
+    /// MIME type for successful responses, otherwise `nil`.
     public override var mimeType: String? {
         statusCode.isSuccess ? meta : nil
     }
     
-    init(url: URL, expectedContentLength: Int, statusCode: GeminiStatusCode, meta: String) {
+    /// Creates a Gemini URL response.
+    ///
+    /// - Parameters:
+    ///   - url: Request URL.
+    ///   - expectedContentLength: Expected body length.
+    ///   - statusCode: Gemini status code.
+    ///   - meta: Gemini meta value.
+    public init(url: URL, expectedContentLength: Int, statusCode: GeminiStatusCode, meta: String) {
         self.statusCode = statusCode
         self.meta = meta
         
@@ -43,14 +54,20 @@ public class GeminiURLResponse: URLResponse {
     
     required init?(coder: NSCoder) {
         let statusCodeValue = coder.decodeInteger(forKey: StatusCodeKey)
-        self.statusCode = GeminiStatusCode(rawValue: statusCodeValue)!
+        guard let statusCode = GeminiStatusCode(rawValue: statusCodeValue) else {
+            return nil
+        }
+        self.statusCode = statusCode
         
-        let meta = coder.decodeObject(of: NSString.self, forKey: MetaKey)! as String
+        guard let meta = coder.decodeObject(of: NSString.self, forKey: MetaKey) as String? else {
+            return nil
+        }
         self.meta = meta
         
         super.init(coder: coder)
     }
     
+    /// Encodes Gemini-specific fields for secure archiving.
     public override func encode(with coder: NSCoder) {
         super.encode(with: coder)
         
@@ -58,10 +75,12 @@ public class GeminiURLResponse: URLResponse {
         coder.encode(meta, forKey: MetaKey)
     }
     
+    /// Returns a copy of this response.
     override public func copy() -> Any {
         return type(of:self).init(self)
     }
     
+    /// Returns a copy of this response.
     override public func copy(with zone: NSZone? = nil) -> Any {
         return type(of:self).init(self)
     }

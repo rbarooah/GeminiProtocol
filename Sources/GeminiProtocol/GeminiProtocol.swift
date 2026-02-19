@@ -1,58 +1,75 @@
 //
 // GeminiProtocol.swift
 //
-// Copyright © 2022 Izzy Fraimow. All rights reserved.
 //
 
 import Foundation
 import Network
 import os.log
 
-public class GeminiProtocol: URLProtocol {
+/// `URLProtocol` implementation that enables `URLSession` support for `gemini://` URLs.
+public class GeminiProtocol: URLProtocol, @unchecked Sendable {
     static let logger = Logger(subsystem: "com.izzy.computer", category: "Protocol")
+    nonisolated(unsafe) static var usePlaintextTransport = false
     
-    var connection: GeminiClient! = nil
+    private var loadingTask: Task<Void, Never>?
     
     enum ProtocolError: Error {
         case taskError(String)
     }
     
+    /// Returns `true` when the request URL uses the `gemini` scheme.
     public override class func canInit(with request: URLRequest) -> Bool {
         Self.logger.debug("Triaging request: \(request)")
         
         guard let url = request.url, let scheme = url.scheme else { return false }
-        
         let normalizedScheme = scheme.lowercased()
-        
         guard normalizedScheme == "gemini" else { return false }
         
         Self.logger.debug("Accepted request: \(request)")
-        
         return true
     }
     
+    /// Returns `true` when the task's current request can be handled as Gemini.
     public override class func canInit(with task: URLSessionTask) -> Bool {
         guard let request = task.currentRequest else { return false }
         return canInit(with: request)
     }
     
+    /// Returns the canonical form of a request.
     public override class func canonicalRequest(for request: URLRequest) -> URLRequest {
-        return request
+        request
     }
     
+    /// Begins loading the Gemini request.
     public override func startLoading() {
-        Task {
-            connection = try! GeminiClient(request: request)
-            guard let client = client else {
-                await connection.stop()
-                client?.urlProtocol(self, didFailWithError: ProtocolError.taskError("URLProtocol client missing"))
-                return
-            }
+        let request = self.request
+        let protocolReference: URLProtocol = self
+        guard let urlProtocolClient = self.client else {
+            Self.logger.error("URLProtocol client missing for request: \(request)")
+            return
+        }
+        let usePlaintextTransport = Self.usePlaintextTransport
+        
+        loadingTask = Task {
+            var connection: GeminiClient?
             
             do {
-                let (header, maybeData) = try await connection.start()
+                let createdConnection = try GeminiClient(request: request, debug: usePlaintextTransport)
+                connection = createdConnection
                 
-                let url = request.url!
+                let (header, maybeData) = try await withTaskCancellationHandler(operation: {
+                    try await createdConnection.start()
+                }, onCancel: {
+                    Task {
+                        await createdConnection.stop()
+                    }
+                })
+                
+                guard let url = request.url else {
+                    throw ProtocolError.taskError("URL missing from URLRequest")
+                }
+                
                 let data = maybeData ?? Data()
                 let response = GeminiURLResponse(
                     url: url,
@@ -61,19 +78,21 @@ public class GeminiProtocol: URLProtocol {
                     meta: header.meta
                 )
                 
-                client.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-                client.urlProtocol(self, didLoad: data)
-                client.urlProtocolDidFinishLoading(self)
+                urlProtocolClient.urlProtocol(protocolReference, didReceive: response, cacheStoragePolicy: .notAllowed)
+                urlProtocolClient.urlProtocol(protocolReference, didLoad: data)
+                urlProtocolClient.urlProtocolDidFinishLoading(protocolReference)
+            } catch is CancellationError {
+                await connection?.stop()
             } catch {
-                await connection.stop()
-                client.urlProtocol(self, didFailWithError: error)
+                await connection?.stop()
+                urlProtocolClient.urlProtocol(protocolReference, didFailWithError: error)
             }
         }
     }
     
+    /// Stops loading and cancels any in-flight task.
     public override func stopLoading() {
-        Task {
-            await connection?.stop()
-        }
+        loadingTask?.cancel()
+        loadingTask = nil
     }
 }
