@@ -9,7 +9,7 @@ This module is intended as an implementation of the Gemini protocol specificatio
 
 This codebase began as a clone/fork of the original project at [frozendevil/GeminiProtocol](https://github.com/frozendevil/GeminiProtocol).
 
-Subsequent updates in this repository were developed with GPT 5.3 Codex.
+Subsequent updates in this repository were developed by GPT-3.5 Codex supervised by Robin Barooah.
 
 ## Usage
 
