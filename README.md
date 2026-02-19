@@ -66,6 +66,19 @@ let feedURL = URL(string: "gemini://example.org/gemlog/")!
 let feed = try GeminiSubscriptionParser.parse(gemtextFeedPage, feedURL: feedURL)
 ```
 
+### Example CLI: Antenna Mirror
+An executable example target is included that fetches `gemini://warmedal.se/~antenna/`, fetches all linked Gemini pages from that front page, converts responses to Markdown, and writes a local output folder.
+
+```bash
+swift run AntennaMirrorExample
+```
+
+Optional output directory:
+
+```bash
+swift run AntennaMirrorExample /tmp/AntennaMirrorOutput
+```
+
 ## Code
 - `GeminiProtocol.swift` contains the implementation of the `URLSession` support.
 - `GeminiNetwork.swift` is a `Network.framework` implementation of a Gemini client.

@@ -20,6 +20,9 @@ let package = Package(
         .target(
             name: "GeminiProtocol",
             dependencies: []),
+        .executableTarget(
+            name: "AntennaMirrorExample",
+            dependencies: ["GeminiProtocol"]),
         .testTarget(
             name: "GeminiProtocolTests",
             dependencies: ["GeminiProtocol"],
