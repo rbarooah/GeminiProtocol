@@ -11,6 +11,8 @@ import os.log
 public class GeminiProtocol: URLProtocol, @unchecked Sendable {
     static let logger = Logger(subsystem: "com.izzy.computer", category: "Protocol")
     nonisolated(unsafe) static var usePlaintextTransport = false
+    /// Controls GeminiProtocol logging. Disabled by default to avoid noisy stdout/stderr output.
+    public nonisolated(unsafe) static var isLoggingEnabled = false
     
     private var loadingTask: Task<Void, Never>?
     
@@ -20,13 +22,17 @@ public class GeminiProtocol: URLProtocol, @unchecked Sendable {
     
     /// Returns `true` when the request URL uses the `gemini` scheme.
     public override class func canInit(with request: URLRequest) -> Bool {
-        Self.logger.debug("Triaging request: \(request)")
+        if isLoggingEnabled {
+            Self.logger.debug("Triaging request: \(request)")
+        }
         
         guard let url = request.url, let scheme = url.scheme else { return false }
         let normalizedScheme = scheme.lowercased()
         guard normalizedScheme == "gemini" else { return false }
         
-        Self.logger.debug("Accepted request: \(request)")
+        if isLoggingEnabled {
+            Self.logger.debug("Accepted request: \(request)")
+        }
         return true
     }
     
@@ -46,7 +52,9 @@ public class GeminiProtocol: URLProtocol, @unchecked Sendable {
         let request = self.request
         let protocolReference: URLProtocol = self
         guard let urlProtocolClient = self.client else {
-            Self.logger.error("URLProtocol client missing for request: \(request)")
+            if Self.isLoggingEnabled {
+                Self.logger.error("URLProtocol client missing for request: \(request)")
+            }
             return
         }
         let usePlaintextTransport = Self.usePlaintextTransport
